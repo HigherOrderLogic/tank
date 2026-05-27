@@ -1,0 +1,303 @@
+// SPDX-License-Identifier: EUPL-1.2
+
+use anyhow::{Context, Result, anyhow, bail};
+use git2::build::CheckoutBuilder;
+use git2::{Cred, CredentialType, Direction, FetchOptions, RemoteCallbacks, Repository};
+use serde_json::{Value, json};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, OnceLock};
+
+use crate::nar;
+
+fn agent() -> &'static ureq::Agent {
+    static AGENT: OnceLock<ureq::Agent> = OnceLock::new();
+    AGENT.get_or_init(|| {
+        let connector = native_tls::TlsConnector::new().expect("init tls");
+        ureq::AgentBuilder::new()
+            .tls_connector(Arc::new(connector))
+            .build()
+    })
+}
+
+enum Target {
+    Github {
+        owner: String,
+        repo: String,
+        reff: Option<String>,
+    },
+    Git {
+        url: String,
+        reff: Option<String>,
+    },
+}
+
+fn parse(expanded: &str) -> Result<Target> {
+    if let Some(body) = expanded.strip_prefix("github:") {
+        let (path, query) = split_query(body);
+        let segs: Vec<&str> = path.split('/').collect();
+        if segs.len() < 2 {
+            bail!("malformed github url: {expanded}");
+        }
+        let reff = query.or_else(|| (segs.len() > 2).then(|| segs[2..].join("/")));
+        return Ok(Target::Github {
+            owner: segs[0].to_string(),
+            repo: segs[1].to_string(),
+            reff,
+        });
+    }
+    if let Some(rest) = expanded.strip_prefix("git+") {
+        let (url, query) = split_query(rest);
+        return Ok(Target::Git {
+            url: url.to_string(),
+            reff: query,
+        });
+    }
+    bail!("unsupported url scheme: {expanded}")
+}
+
+fn split_query(s: &str) -> (&str, Option<String>) {
+    match s.split_once('?') {
+        None => (s, None),
+        Some((path, q)) => {
+            let reff = q
+                .split('&')
+                .find_map(|kv| kv.strip_prefix("ref="))
+                .map(str::to_string);
+            (path, reff)
+        }
+    }
+}
+
+/// upstream rev, no tree fetch
+pub fn current_rev(expanded: &str) -> Result<String> {
+    match parse(expanded)? {
+        Target::Github { owner, repo, reff } => {
+            let reff = reff.as_deref().unwrap_or("HEAD");
+            Ok(gh_commit(&owner, &repo, reff)?.0)
+        }
+        Target::Git { url, reff } => {
+            let cb = callbacks();
+            let mut remote = git2::Remote::create_detached(url.as_str())?;
+            let conn = remote.connect_auth(Direction::Fetch, Some(cb), None)?;
+            let want = full_ref(reff.as_deref(), || branch_str(conn.default_branch()));
+            for head in conn.list()? {
+                if head.name() == want {
+                    return Ok(head.oid().to_string());
+                }
+            }
+            bail!("ref {want} not found on {url}")
+        }
+    }
+}
+
+/// fetch the tree, return (locked node, rev)
+pub fn fetch_pin(expanded: &str, submodules: bool) -> Result<(Value, String)> {
+    match parse(expanded)? {
+        Target::Github { owner, repo, reff } => {
+            let reff = reff.as_deref().unwrap_or("HEAD");
+            let (rev, last_modified) = gh_commit(&owner, &repo, reff)?;
+            let dir = tempfile::tempdir()?;
+            let root = download_github_tarball(&owner, &repo, &rev, dir.path())?;
+            let nar_hash = nar::hash_path(&root)?;
+            let node = json!({
+                "type": "github",
+                "owner": owner,
+                "repo": repo,
+                "rev": rev,
+                "narHash": nar_hash,
+                "lastModified": last_modified,
+            });
+            Ok((node, rev))
+        }
+        Target::Git { url, reff } => {
+            let dir = tempfile::tempdir()?;
+            let (rev, last_modified, refname) =
+                git_checkout(&url, reff.as_deref(), submodules, dir.path())?;
+            std::fs::remove_dir_all(dir.path().join(".git")).ok();
+            let nar_hash = nar::hash_path(dir.path())?;
+            let mut node = json!({
+                "type": "git",
+                "url": url,
+                "ref": refname,
+                "rev": rev,
+                "narHash": nar_hash,
+                "lastModified": last_modified,
+            });
+            if submodules {
+                node["submodules"] = json!(true);
+            }
+            Ok((node, rev))
+        }
+    }
+}
+
+fn gh_commit(owner: &str, repo: &str, reff: &str) -> Result<(String, i64)> {
+    let url = format!("https://api.github.com/repos/{owner}/{repo}/commits/{reff}");
+    let mut req = agent()
+        .get(&url)
+        .set("User-Agent", "tack")
+        .set("Accept", "application/vnd.github+json");
+    if let Ok(token) = std::env::var("GITHUB_TOKEN") {
+        req = req.set("Authorization", &format!("Bearer {token}"));
+    }
+    let body = req
+        .call()
+        .with_context(|| format!("github api {owner}/{repo}@{reff}"))?
+        .into_string()?;
+    let v: Value = serde_json::from_str(&body)?;
+    let rev = v["sha"]
+        .as_str()
+        .ok_or_else(|| anyhow!("no sha in github response for {owner}/{repo}@{reff}"))?
+        .to_string();
+    let date = v["commit"]["committer"]["date"]
+        .as_str()
+        .ok_or_else(|| anyhow!("no commit date for {owner}/{repo}@{reff}"))?;
+    Ok((rev, epoch_from_iso(date)?))
+}
+
+fn download_github_tarball(owner: &str, repo: &str, rev: &str, into: &Path) -> Result<PathBuf> {
+    let url = format!("https://codeload.github.com/{owner}/{repo}/tar.gz/{rev}");
+    let reader = agent()
+        .get(&url)
+        .set("User-Agent", "tack")
+        .call()
+        .with_context(|| format!("download {url}"))?
+        .into_reader();
+    let gz = flate2::read::GzDecoder::new(reader);
+    let mut archive = tar::Archive::new(gz);
+    archive.set_preserve_permissions(true);
+    archive.unpack(into)?;
+    // codeload wraps everything in one repo-rev/ dir
+    let mut dirs = std::fs::read_dir(into)?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.is_dir());
+    let root = dirs
+        .next()
+        .ok_or_else(|| anyhow!("empty tarball for {owner}/{repo}"))?;
+    if dirs.next().is_some() {
+        bail!("unexpected multiple top-level dirs in {owner}/{repo} tarball");
+    }
+    Ok(root)
+}
+
+/// check out `reff` (or remote default) into `into`; return (rev, time, refname)
+fn git_checkout(
+    url: &str,
+    reff: Option<&str>,
+    submodules: bool,
+    into: &Path,
+) -> Result<(String, i64, String)> {
+    let repo = Repository::init(into)?;
+    let mut remote = repo.remote_anonymous(url)?;
+
+    let refname = {
+        let conn = remote.connect_auth(Direction::Fetch, Some(callbacks()), None)?;
+        full_ref(reff, || branch_str(conn.default_branch()))
+    };
+
+    let mut fo = FetchOptions::new();
+    fo.remote_callbacks(callbacks());
+    fo.depth(1);
+    remote
+        .fetch(&[&refname], Some(&mut fo), None)
+        .with_context(|| format!("fetch {refname} from {url}"))?;
+
+    let commit = repo.find_reference("FETCH_HEAD")?.peel_to_commit()?;
+    let rev = commit.id().to_string();
+    let time = commit.time().seconds();
+
+    repo.checkout_tree(
+        commit.tree()?.as_object(),
+        Some(CheckoutBuilder::new().force()),
+    )?;
+    if submodules {
+        update_submodules(&repo)?;
+    }
+    Ok((rev, time, refname))
+}
+
+fn update_submodules(repo: &Repository) -> Result<()> {
+    for mut sm in repo.submodules()? {
+        let mut opts = git2::SubmoduleUpdateOptions::new();
+        let mut fo = FetchOptions::new();
+        fo.remote_callbacks(callbacks());
+        opts.fetch(fo);
+        sm.update(true, Some(&mut opts))?;
+    }
+    Ok(())
+}
+
+fn branch_str(b: Result<git2::Buf, git2::Error>) -> Option<String> {
+    b.ok().and_then(|b| b.as_str().map(str::to_string))
+}
+
+fn full_ref(reff: Option<&str>, default: impl FnOnce() -> Option<String>) -> String {
+    match reff {
+        Some(r) if r.starts_with("refs/") => r.to_string(),
+        Some(r) => format!("refs/heads/{r}"),
+        None => default().unwrap_or_else(|| "HEAD".to_string()),
+    }
+}
+
+fn callbacks() -> RemoteCallbacks<'static> {
+    let mut cb = RemoteCallbacks::new();
+    cb.credentials(|_url, username, allowed| {
+        let user = username.unwrap_or("git");
+        if allowed.contains(CredentialType::SSH_KEY) {
+            Cred::ssh_key_from_agent(user)
+        } else if allowed.contains(CredentialType::USERNAME) {
+            Cred::username(user)
+        } else {
+            Err(git2::Error::from_str("no supported credential type"))
+        }
+    });
+    cb
+}
+
+/// iso8601 to unix seconds
+fn epoch_from_iso(s: &str) -> Result<i64> {
+    let b = s.as_bytes();
+    if b.len() < 20 {
+        bail!("bad timestamp: {s}");
+    }
+    let n = |r: std::ops::Range<usize>| -> Result<i64> {
+        s[r].parse().with_context(|| format!("bad timestamp: {s}"))
+    };
+    let (y, m, d) = (n(0..4)?, n(5..7)?, n(8..10)?);
+    let (hh, mi, ss) = (n(11..13)?, n(14..16)?, n(17..19)?);
+    Ok(days_from_civil(y, m, d) * 86400 + hh * 3600 + mi * 60 + ss)
+}
+
+/// days since 1970-01-01 (howard hinnant)
+fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146097 + doe - 719468
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // our tarball nar hash must equal nix's narHash for this rev
+    // cargo test -- --ignored
+    #[test]
+    #[ignore]
+    fn github_narhash_matches_nix() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = download_github_tarball(
+            "bertof",
+            "nix-rice",
+            "98b16b0f649bb41db9a1c3b32191bccb9a1ec271",
+            dir.path(),
+        )
+        .unwrap();
+        assert_eq!(
+            crate::nar::hash_path(&root).unwrap(),
+            "sha256-nt/xmuXaJB/vWlRJ4wpdlYQCIgCzFR6QJwlRyhfNn5o="
+        );
+    }
+}

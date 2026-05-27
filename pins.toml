@@ -1,0 +1,17 @@
+# tack pins. edit by hand or with tack add / rm / alias
+# nix reads pins.lock.json; this file drives tack update
+
+# shorturl schemes. scheme:rest expands rest into {path}
+[shorturls]
+# atagen = "git+https://git.example.com/atagen/{path}"
+# gh     = "github:{path}"
+
+# [inputs.<name>] fields
+#   url             required, shorturl ok
+#   flake           default true; false exposes the source path
+#   follows         { child = "pin" } override map
+#   exclude_follow  all_follow names to skip
+#   dir             subdir holding flake.nix
+#   submodules      fetch git submodules
+[inputs.nixpkgs]
+url = "github:nixos/nixpkgs/nixpkgs-unstable"
