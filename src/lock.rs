@@ -28,3 +28,7 @@ pub fn save(path: &Path, lock: &Lock) -> Result<()> {
 pub fn rev_of(node: &Value) -> Option<&str> {
     node.get("rev")?.as_str()
 }
+
+pub fn hash_of(node: &Value) -> Option<&str> {
+    node.get("narHash")?.as_str()
+}

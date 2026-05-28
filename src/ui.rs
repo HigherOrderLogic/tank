@@ -12,6 +12,7 @@ pub enum PinStatus {
     Fetching,
     NoChange,
     Updated { old: String, new: String },
+    Drift { rev: String },
     Failed(String),
 }
 
@@ -95,6 +96,7 @@ fn glyph(st: &PinStatus, frame: usize) -> String {
         PinStatus::Fetching => (34, FRAMES[frame % FRAMES.len()]),
         PinStatus::NoChange => (33, '-'),
         PinStatus::Updated { .. } => (32, '✓'),
+        PinStatus::Drift { .. } => (31, '!'),
         PinStatus::Failed(_) => (31, '✗'),
     };
     format!("\x1b[{color}m{ch}\x1b[0m")
@@ -103,6 +105,9 @@ fn glyph(st: &PinStatus, frame: usize) -> String {
 fn suffix(st: &PinStatus) -> String {
     match st {
         PinStatus::Updated { old, new } => format!("  {old} -> {new}"),
+        PinStatus::Drift { rev } => {
+            format!("  DRIFT: rev {rev} unchanged but content differs (lock kept)")
+        }
         PinStatus::Failed(msg) => format!("  {msg}"),
         _ => String::new(),
     }
@@ -112,6 +117,9 @@ fn plain_line(name: &str, st: &PinStatus) -> Option<String> {
     match st {
         PinStatus::Updated { old, new } => Some(format!("{name}: {old} -> {new}")),
         PinStatus::NoChange => Some(format!("{name}: unchanged")),
+        PinStatus::Drift { rev } => Some(format!(
+            "{name}: DRIFT: rev {rev} unchanged but content differs (lock kept)"
+        )),
         PinStatus::Failed(msg) => Some(format!("{name}: FAILED: {msg}")),
         _ => None,
     }

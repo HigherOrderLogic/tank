@@ -4,6 +4,7 @@ use anyhow::{Result, bail};
 use rayon::prelude::*;
 use serde_json::Value;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::ui::{Display, PinStatus};
 use crate::{fetch, lock, pins, shorturl};
@@ -144,6 +145,7 @@ pub fn update(names: &[String]) -> Result<()> {
     let mut lk = lock::load(&lock_path(&d))?;
 
     let display = Display::new(selected.iter().map(|i| i.name.clone()).collect());
+    let drift = AtomicUsize::new(0);
 
     let results: Vec<Option<Value>> = selected
         .par_iter()
@@ -151,17 +153,28 @@ pub fn update(names: &[String]) -> Result<()> {
         .map(|(i, inp)| {
             display.set(i, PinStatus::Fetching);
             let expanded = shorturl::expand(&inp.url, &shorturls);
-            let old = lk.get(&inp.name).and_then(lock::rev_of).map(str::to_string);
+            let old = lk.get(&inp.name);
+            let old_rev = old.and_then(lock::rev_of);
             match fetch::fetch_pin(&expanded, inp.submodules) {
-                Ok((_, rev)) if old.as_deref() == Some(rev.as_str()) => {
-                    display.set(i, PinStatus::NoChange);
+                Ok((node, rev)) if old_rev == Some(rev.as_str()) => {
+                    // same rev, if hash moved, upstream changed under a stable rev
+                    let drifted = matches!(
+                        (old.and_then(lock::hash_of), lock::hash_of(&node)),
+                        (Some(o), Some(n)) if o != n
+                    );
+                    if drifted {
+                        drift.fetch_add(1, Ordering::Relaxed);
+                        display.set(i, PinStatus::Drift { rev: short(&rev) });
+                    } else {
+                        display.set(i, PinStatus::NoChange);
+                    }
                     None
                 }
                 Ok((node, rev)) => {
                     display.set(
                         i,
                         PinStatus::Updated {
-                            old: old.as_deref().map(short).unwrap_or_else(|| "NEW".into()),
+                            old: old_rev.map(short).unwrap_or_else(|| "NEW".into()),
                             new: short(&rev),
                         },
                     );
@@ -186,6 +199,12 @@ pub fn update(names: &[String]) -> Result<()> {
         lock::save(&lock_path(&d), &lk)?;
     }
     display.finish();
+
+    if drift.into_inner() > 0 {
+        bail!(
+            "locked rev unchanged but upstream content differs (lock kept; investigate before relocking)"
+        );
+    }
     Ok(())
 }
 
