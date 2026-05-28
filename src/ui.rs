@@ -27,8 +27,22 @@ pub enum PinStatus {
     Pending,
     Fetching,
     NoChange,
-    Updated { old: String, new: String },
-    Drift { rev: String, accepted: bool },
+    Updated {
+        old: String,
+        new: String,
+    },
+    Drift {
+        rev:      String,
+        accepted: bool,
+    },
+    /// fixed-pin identity moved; old + new sha256 short forms
+    FixedDrift {
+        old:      String,
+        new:      String,
+        accepted: bool,
+    },
+    /// pin intentionally skipped with a one-line note
+    Skipped(String),
     Failed(String),
 }
 
@@ -119,16 +133,22 @@ fn draw(names: &[String], states: &[PinStatus], frame: usize, drawn: bool) {
 }
 
 fn glyph(st: &PinStatus, frame: usize) -> String {
-    let (color, ch) = match *st {
-        PinStatus::Pending => (2_i32, '\u{b7}'),
-        PinStatus::Fetching => (34_i32, FRAMES[frame % FRAMES.len()]),
-        PinStatus::NoChange => (33_i32, '-'),
-        PinStatus::Updated { .. } => (32_i32, '\u{2713}'),
-        PinStatus::Drift { accepted: true, .. } => (33_i32, '~'),
+    let (color, ch) = match st {
+        PinStatus::Pending => (2, '·'),
+        PinStatus::Fetching => (34, FRAMES[frame % FRAMES.len()]),
+        PinStatus::NoChange => (33, '-'),
+        PinStatus::Updated { .. } => (32, '✓'),
+        PinStatus::Drift { accepted: true, .. } | PinStatus::FixedDrift { accepted: true, .. } => {
+            (33, '~')
+        },
         PinStatus::Drift {
             accepted: false, ..
-        } => (31_i32, '!'),
-        PinStatus::Failed(_) => (31_i32, '\u{2717}'),
+        }
+        | PinStatus::FixedDrift {
+            accepted: false, ..
+        } => (31, '!'),
+        PinStatus::Skipped(_) => (2, '·'),
+        PinStatus::Failed(_) => (31, '✗'),
     };
     format!("\x1b[{color}m{ch}\x1b[0m")
 }
@@ -148,8 +168,25 @@ fn suffix(st: &PinStatus) -> String {
         } => {
             format!("  DRIFT: rev {rev} content changed, relocked (--accept)")
         },
+        PinStatus::FixedDrift {
+            ref old,
+            ref new,
+            accepted: false,
+        } => {
+            format!(
+                "  DRIFT: fixed pin sha256 changed {old} -> {new} (lock kept; --accept to relock)"
+            )
+        },
+        PinStatus::FixedDrift {
+            ref old,
+            ref new,
+            accepted: true,
+        } => {
+            format!("  DRIFT: fixed pin sha256 changed {old} -> {new}, relocked (--accept)")
+        },
+        PinStatus::Skipped(ref note) => format!("  {note}"),
         PinStatus::Failed(ref msg) => format!("  {msg}"),
-        PinStatus::Pending | PinStatus::Fetching | PinStatus::NoChange => String::new(),
+        _ => String::new(),
     }
 }
 
@@ -173,7 +210,27 @@ fn plain_line(name: &str, st: &PinStatus) -> Option<String> {
                 "{name}: DRIFT: rev {rev} content changed, relocked (--accept)"
             ))
         },
+        PinStatus::FixedDrift {
+            ref old,
+            ref new,
+            accepted: false,
+        } => {
+            Some(format!(
+                "{name}: DRIFT: fixed pin sha256 changed {old} -> {new} (lock kept; --accept to \
+                 relock)"
+            ))
+        },
+        PinStatus::FixedDrift {
+            ref old,
+            ref new,
+            accepted: true,
+        } => {
+            Some(format!(
+                "{name}: DRIFT: fixed pin sha256 changed {old} -> {new}, relocked (--accept)"
+            ))
+        },
+        PinStatus::Skipped(ref note) => Some(format!("{name}: {note}")),
         PinStatus::Failed(ref msg) => Some(format!("{name}: FAILED: {msg}")),
-        PinStatus::Pending | PinStatus::Fetching => None,
+        _ => None,
     }
 }

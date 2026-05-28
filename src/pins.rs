@@ -18,10 +18,76 @@ use toml_edit::{
     value,
 };
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PinType {
+    Flake,
+    Fetch,
+    Fixed,
+}
+
+impl PinType {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Flake => "flake",
+            Self::Fetch => "fetch",
+            Self::Fixed => "fixed",
+        }
+    }
+
+    fn parse(s: &str) -> Result<Self> {
+        match s {
+            "flake" => Ok(Self::Flake),
+            "fetch" => Ok(Self::Fetch),
+            "fixed" => Ok(Self::Fixed),
+            other => bail!("unknown pin type '{other}' (expected flake|fetch|fixed)"),
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Unpack {
+    Tarball,
+    File,
+}
+
+impl Unpack {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Tarball => "tarball",
+            Self::File => "file",
+        }
+    }
+
+    fn parse(s: &str) -> Result<Self> {
+        match s {
+            "tarball" => Ok(Self::Tarball),
+            "file" => Ok(Self::File),
+            other => bail!("unknown unpack '{other}' (expected tarball|file)"),
+        }
+    }
+
+    /// guess from a URL extension; tarball-family wins, otherwise file
+    pub fn detect(url: &str) -> Self {
+        let path = url.split('?').next().unwrap_or(url);
+        let path = path.split('#').next().unwrap_or(path);
+        let lower = path.to_ascii_lowercase();
+        let tarballish = [
+            ".tar", ".tar.gz", ".tgz", ".tar.bz2", ".tbz", ".tbz2", ".tar.xz", ".txz",
+        ];
+        if tarballish.iter().any(|s| lower.ends_with(s)) {
+            Self::Tarball
+        } else {
+            Self::File
+        }
+    }
+}
+
 pub struct Input {
     pub name:       String,
     pub url:        String,
     pub submodules: bool,
+    pub pin_type:   PinType,
+    pub unpack:     Option<Unpack>,
 }
 
 pub fn load(path: &Path) -> Result<DocumentMut> {
@@ -65,13 +131,33 @@ pub fn inputs(doc: &DocumentMut) -> Result<Vec<Input>> {
             .get("url")
             .and_then(Item::as_str)
             .with_context(|| format!("input '{name}' has no url"))?;
+        // `type` is canonical; legacy `flake = false` reads as `fetch`
+        let pin_type = match table.get("type").and_then(Item::as_str) {
+            Some(s) => PinType::parse(s).with_context(|| format!("input '{name}'"))?,
+            None => {
+                match table.get("flake").and_then(Item::as_bool) {
+                    Some(false) => PinType::Fetch,
+                    _ => PinType::Flake,
+                }
+            },
+        };
+        let unpack = table
+            .get("unpack")
+            .and_then(Item::as_str)
+            .map(|s| Unpack::parse(s).with_context(|| format!("input '{name}'")))
+            .transpose()?;
+        if pin_type != PinType::Fixed && unpack.is_some() {
+            bail!("input '{name}': `unpack` is only valid for type = \"fixed\"");
+        }
         out.push(Input {
-            name:       name.to_owned(),
-            url:        url.to_owned(),
+            name: name.to_owned(),
+            url: url.to_owned(),
             submodules: entry
                 .get("submodules")
                 .and_then(Item::as_bool)
                 .unwrap_or(false),
+            pin_type,
+            unpack,
         });
     }
     Ok(out)
@@ -87,7 +173,8 @@ pub fn add_input(
     doc: &mut DocumentMut,
     name: &str,
     url: &str,
-    flake: bool,
+    pin_type: PinType,
+    unpack: Option<Unpack>,
     dir: Option<&str>,
     submodules: bool,
     follows: &[(String, String)],
@@ -95,8 +182,11 @@ pub fn add_input(
     let mut entry = Table::new();
     entry.set_implicit(false);
     entry["url"] = value(url);
-    if !flake {
-        entry["flake"] = value(false);
+    if pin_type != PinType::Flake {
+        entry["type"] = value(pin_type.as_str());
+    }
+    if let Some(u) = unpack {
+        entry["unpack"] = value(u.as_str());
     }
     if let Some(subdir) = dir {
         entry["dir"] = value(subdir);
