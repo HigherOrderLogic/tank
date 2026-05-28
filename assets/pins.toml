@@ -11,7 +11,7 @@
 # nixpkgs = "nixpkgs"
 
 # [inputs.<name>] fields
-#   url             required, shorturl ok
+#   url             required, shorturl ok; ?rev=<sha> pins an exact commit
 #   flake           default true; false exposes the source path
 #   follows         { child = "pin" } override map
 #   exclude_follow  all_follow names to skip

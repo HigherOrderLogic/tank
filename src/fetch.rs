@@ -28,17 +28,20 @@ enum Target {
     Git {
         url: String,
         reff: Option<String>,
+        rev: Option<String>,
     },
 }
 
 fn parse(expanded: &str) -> Result<Target> {
     if let Some(body) = expanded.strip_prefix("github:") {
-        let (path, query) = split_query(body);
+        let (path, reff, rev) = split_query(body);
         let segs: Vec<&str> = path.split('/').collect();
         if segs.len() < 2 {
             bail!("malformed github url: {expanded}");
         }
-        let reff = query.or_else(|| (segs.len() > 2).then(|| segs[2..].join("/")));
+        let reff = reff
+            .or(rev)
+            .or_else(|| (segs.len() > 2).then(|| segs[2..].join("/")));
         return Ok(Target::Github {
             owner: segs[0].to_string(),
             repo: segs[1].to_string(),
@@ -46,26 +49,30 @@ fn parse(expanded: &str) -> Result<Target> {
         });
     }
     if let Some(rest) = expanded.strip_prefix("git+") {
-        let (url, query) = split_query(rest);
+        let (url, reff, rev) = split_query(rest);
         return Ok(Target::Git {
             url: url.to_string(),
-            reff: query,
+            reff,
+            rev,
         });
     }
     bail!("unsupported url scheme: {expanded}")
 }
 
-fn split_query(s: &str) -> (&str, Option<String>) {
-    match s.split_once('?') {
-        None => (s, None),
-        Some((path, q)) => {
-            let reff = q
-                .split('&')
-                .find_map(|kv| kv.strip_prefix("ref="))
-                .map(str::to_string);
-            (path, reff)
+/// pull out ref= and rev=
+fn split_query(s: &str) -> (&str, Option<String>, Option<String>) {
+    let Some((path, q)) = s.split_once('?') else {
+        return (s, None, None);
+    };
+    let (mut reff, mut rev) = (None, None);
+    for kv in q.split('&') {
+        if let Some(v) = kv.strip_prefix("ref=") {
+            reff = Some(v.to_string());
+        } else if let Some(v) = kv.strip_prefix("rev=") {
+            rev = Some(v.to_string());
         }
     }
+    (path, reff, rev)
 }
 
 /// upstream rev, no tree fetch
@@ -75,7 +82,11 @@ pub fn current_rev(expanded: &str) -> Result<String> {
             let reff = reff.as_deref().unwrap_or("HEAD");
             Ok(gh_commit(&owner, &repo, reff)?.0)
         }
-        Target::Git { url, reff } => {
+        Target::Git { url, reff, rev } => {
+            // a pinned rev never moves; report it without touching the network
+            if let Some(rev) = rev {
+                return Ok(rev);
+            }
             let cb = callbacks();
             let mut remote = git2::Remote::create_detached(url.as_str())?;
             let conn = remote.connect_auth(Direction::Fetch, Some(cb), None)?;
@@ -109,10 +120,15 @@ pub fn fetch_pin(expanded: &str, submodules: bool) -> Result<(Value, String)> {
             });
             Ok((node, rev))
         }
-        Target::Git { url, reff } => {
+        Target::Git { url, reff, rev } => {
             let dir = tempfile::tempdir()?;
-            let (rev, last_modified, refname) =
-                git_checkout(&url, reff.as_deref(), submodules, dir.path())?;
+            let (rev, last_modified, refname) = git_checkout(
+                &url,
+                reff.as_deref(),
+                rev.as_deref(),
+                submodules,
+                dir.path(),
+            )?;
             std::fs::remove_dir_all(dir.path().join(".git")).ok();
             let nar_hash = nar::hash_path(dir.path())?;
             let mut node = json!({
@@ -180,10 +196,12 @@ fn download_github_tarball(owner: &str, repo: &str, rev: &str, into: &Path) -> R
     Ok(root)
 }
 
-/// check out `reff` (or remote default) into `into`; return (rev, time, refname)
+/// check out `rev` (if given) or the tip of `reff` (or remote default) into
+/// `into`; return (rev, time, refname)
 fn git_checkout(
     url: &str,
     reff: Option<&str>,
+    rev: Option<&str>,
     submodules: bool,
     into: &Path,
 ) -> Result<(String, i64, String)> {
@@ -197,12 +215,23 @@ fn git_checkout(
 
     let mut fo = FetchOptions::new();
     fo.remote_callbacks(callbacks());
-    fo.depth(1);
+    // a specific rev can be anywhere in history, so fetch the ref in full;
+    // for a moving ref we only need the tip
+    if rev.is_none() {
+        fo.depth(1);
+    }
     remote
         .fetch(&[&refname], Some(&mut fo), None)
         .with_context(|| format!("fetch {refname} from {url}"))?;
 
-    let commit = repo.find_reference("FETCH_HEAD")?.peel_to_commit()?;
+    let commit = match rev {
+        Some(rev) => repo
+            .revparse_single(rev)
+            .with_context(|| format!("rev '{rev}' not reachable from {refname} on {url}"))?
+            .peel_to_commit()
+            .with_context(|| format!("'{rev}' is not a commit"))?,
+        None => repo.find_reference("FETCH_HEAD")?.peel_to_commit()?,
+    };
     let rev = commit.id().to_string();
     let time = commit.time().seconds();
 
@@ -281,6 +310,33 @@ fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn git_rev_query() {
+        match parse("git+https://example.com/o/r?ref=main&rev=abc123").unwrap() {
+            Target::Git { url, reff, rev } => {
+                assert_eq!(url, "https://example.com/o/r");
+                assert_eq!(reff.as_deref(), Some("main"));
+                assert_eq!(rev.as_deref(), Some("abc123"));
+            }
+            _ => panic!("expected git target"),
+        }
+        match parse("git+ssh://git@example.com/o/r?rev=deadbeef").unwrap() {
+            Target::Git { reff, rev, .. } => {
+                assert_eq!(reff, None);
+                assert_eq!(rev.as_deref(), Some("deadbeef"));
+            }
+            _ => panic!("expected git target"),
+        }
+    }
+
+    #[test]
+    fn github_rev_is_committish() {
+        match parse("github:o/r?rev=abc123").unwrap() {
+            Target::Github { reff, .. } => assert_eq!(reff.as_deref(), Some("abc123")),
+            _ => panic!("expected github target"),
+        }
+    }
 
     // our tarball nar hash must equal nix's narHash for this rev
     // cargo test -- --ignored
