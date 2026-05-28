@@ -14,7 +14,7 @@
 #   dir             subdir holding flake.nix
 #   submodules      fetch git submodules
 [inputs.nixpkgs]
-url = "github:nixos/nixpkgs/nixpkgs-unstable"
+url = "github:nixos/nixpkgs/nixos-unstable-small"
 
 # nightly rust for the `fmt` devshell only.
 [inputs.fenix]
