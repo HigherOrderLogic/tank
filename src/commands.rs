@@ -28,18 +28,34 @@ fn short(rev: &str) -> String {
     rev.chars().take(7).collect()
 }
 
+fn write_atomic(path: &Path, contents: &str) -> Result<()> {
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".tmp");
+    let tmp = PathBuf::from(tmp);
+    std::fs::write(&tmp, contents)?;
+    std::fs::rename(&tmp, path)?;
+    Ok(())
+}
+
 pub fn init(force: bool) -> Result<()> {
     let d = dir();
     let (pt, lp, ip) = (pins_path(&d), lock_path(&d), d.join("inputs.nix"));
 
-    if pt.exists() && !force {
-        bail!("{} already exists (use --force)", pt.display());
+    if !force {
+        let clash: Vec<String> = [&pt, &ip]
+            .into_iter()
+            .filter(|p| p.exists())
+            .map(|p| p.display().to_string())
+            .collect();
+        if !clash.is_empty() {
+            bail!("{} already exists (use --force)", clash.join(", "));
+        }
     }
-    std::fs::write(&pt, STARTER_TOML)?;
+    write_atomic(&pt, STARTER_TOML)?;
     if !lp.exists() {
-        std::fs::write(&lp, "{}\n")?;
+        write_atomic(&lp, "{}\n")?;
     }
-    std::fs::write(&ip, RESOLVER_NIX)?;
+    write_atomic(&ip, RESOLVER_NIX)?;
 
     println!("initialised tack in {}", d.display());
     println!("  pins.toml       edit shorturls and inputs here");
