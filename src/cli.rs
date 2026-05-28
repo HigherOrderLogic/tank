@@ -6,6 +6,11 @@ use anyhow::{
     bail,
 };
 
+use crate::pins::{
+    PinType,
+    Unpack,
+};
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum Command {
     Init {
@@ -21,7 +26,8 @@ pub enum Command {
     Add {
         name:       String,
         url:        String,
-        flake:      bool,
+        pin_type:   PinType,
+        unpack:     Option<Unpack>,
         dir:        Option<String>,
         submodules: bool,
         follows:    Vec<(String, String)>,
@@ -86,13 +92,27 @@ fn parse_parser(mut parser: lexopt::Parser) -> Result<Command> {
         },
         "add" => {
             let (mut name, mut url) = (None, None);
-            let mut flake = true;
+            let mut pin_type = PinType::Flake;
+            let mut unpack: Option<Unpack> = None;
             let mut dir = None;
             let mut submodules = false;
             let mut follows = Vec::new();
-            while let Some(arg) = parser.next()? {
-                match arg {
-                    Long("no-flake") => flake = false,
+            while let Some(a) = p.next()? {
+                match a {
+                    Long("no-flake") => pin_type = PinType::Fetch,
+                    Long("fetch") => pin_type = PinType::Fetch,
+                    Long("fixed") => pin_type = PinType::Fixed,
+                    Long("unpack") => {
+                        let s = p
+                            .value()?
+                            .string()
+                            .map_err(|_| anyhow::anyhow!("bad unpack"))?;
+                        unpack = Some(match s.as_str() {
+                            "tarball" => Unpack::Tarball,
+                            "file" => Unpack::File,
+                            other => bail!("unknown unpack '{other}' (expected tarball|file)"),
+                        });
+                    },
                     Long("submodules") => submodules = true,
                     Long("dir") => {
                         dir = Some(
@@ -127,7 +147,8 @@ fn parse_parser(mut parser: lexopt::Parser) -> Result<Command> {
             Ok(Command::Add {
                 name: name.context("add: missing <name>")?,
                 url: url.context("add: missing <url>")?,
-                flake,
+                pin_type,
+                unpack,
                 dir,
                 submodules,
                 follows,

@@ -36,9 +36,14 @@ pub fn hash_path(root: &Path) -> Result<String> {
     Ok(format!("sha256-{}", b64(&hash.finalize())))
 }
 
-fn emit_node(hash: &mut Sha256, path: &mut PathBuf) -> Result<()> {
-    let meta = fs::symlink_metadata(&path).with_context(|| format!("stat {}", path.display()))?;
-    emit_bytes(hash, b"(");
+/// sri sha256 of raw bytes; matches what `builtin:fetchurl` checks against
+pub fn hash_bytes(bytes: &[u8]) -> String {
+    format!("sha256-{}", b64(&Sha256::digest(bytes)))
+}
+
+fn emit_node(h: &mut Sha256, path: &Path) -> Result<()> {
+    let meta = fs::symlink_metadata(path).with_context(|| format!("stat {}", path.display()))?;
+    emit_bytes(h, b"(");
     if meta.is_symlink() {
         let target = fs::read_link(&path)?;
         emit_bytes(hash, b"type");

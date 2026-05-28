@@ -24,6 +24,10 @@ use crate::{
     fetch,
     lock,
     pins,
+    pins::{
+        PinType,
+        Unpack,
+    },
     shorturl,
     ui::{
         Display,
@@ -105,6 +109,9 @@ fn short(rev: &str) -> String {
             return seg.chars().take(16).collect();
         }
     }
+    if let Some(b64) = rev.strip_prefix("sha256-") {
+        return format!("sha256-{}", b64.chars().take(12).collect::<String>());
+    }
     rev.chars().take(7).collect()
 }
 
@@ -157,21 +164,31 @@ pub fn init(force: bool) -> Result<()> {
 pub fn add(
     name: &str,
     url: &str,
-    flake: bool,
+    pin_type: PinType,
+    unpack: Option<Unpack>,
     dir_field: Option<&str>,
     submodules: bool,
     follows: &[(String, String)],
 ) -> Result<()> {
-    let dir = dir();
-    let mut doc = pins::load(&pins_path(&dir))?;
+    if unpack.is_some() && pin_type != PinType::Fixed {
+        bail!("--unpack is only valid with --fixed");
+    }
+    let d = dir();
+    let mut doc = pins::load(&pins_path(&d))?;
     if pins::has_input(&doc, name) {
         bail!("input '{name}' already exists");
     }
-    pins::add_input(&mut doc, name, url, flake, dir_field, submodules, follows);
-    pins::save(&pins_path(&dir), &doc)?;
+    pins::add_input(
+        &mut doc, name, url, pin_type, unpack, dir_field, submodules, follows,
+    );
+    pins::save(&pins_path(&d), &doc)?;
 
     let expanded = shorturl::expand(url, &pins::shorturls(&doc));
-    match fetch::fetch_pin(&expanded, submodules) {
+    let fetched = match pin_type {
+        PinType::Fixed => fetch::fetch_fixed_pin(&expanded, unpack),
+        _ => fetch::fetch_pin(&expanded, submodules),
+    };
+    match fetched {
         Ok((node, rev)) => {
             let mut lk = lock::load(&lock_path(&dir))?;
             lk.insert(name.to_owned(), node);
@@ -247,7 +264,39 @@ pub fn update(names: &[String], accept: bool) -> Result<()> {
             let expanded = shorturl::expand(&inp.url, &shorturls);
             let old = lk.get(&inp.name);
             let old_rev = old.and_then(lock::rev_of);
-            match fetch::fetch_pin(&expanded, inp.submodules) {
+            let fetched = match inp.pin_type {
+                PinType::Fixed => fetch::fetch_fixed_pin(&expanded, inp.unpack),
+                _ => fetch::fetch_pin(&expanded, inp.submodules),
+            };
+            match fetched {
+                // for fixed pins sha256 is the identity; any mismatch is drift
+                Ok((node, rev))
+                    if inp.pin_type == PinType::Fixed
+                        && old_rev.is_some()
+                        && old_rev != Some(rev.as_str()) =>
+                {
+                    let old_short = old_rev.map(short).unwrap_or_default();
+                    let new_short = short(&rev);
+                    match accept {
+                        true => {
+                            display.set(i, PinStatus::FixedDrift {
+                                old:      old_short,
+                                new:      new_short,
+                                accepted: true,
+                            });
+                            Some(node)
+                        },
+                        false => {
+                            drift.fetch_add(1, Ordering::Relaxed);
+                            display.set(i, PinStatus::FixedDrift {
+                                old:      old_short,
+                                new:      new_short,
+                                accepted: false,
+                            });
+                            None
+                        },
+                    }
+                },
                 Ok((node, rev)) if old_rev == Some(rev.as_str()) => {
                     // same rev, if hash moved, upstream changed under a stable rev
                     let drifted = matches!(
@@ -308,8 +357,8 @@ pub fn update(names: &[String], accept: bool) -> Result<()> {
 
     if drift.into_inner() > 0 {
         bail!(
-            "locked rev unchanged but upstream content differs (lock kept; investigate before \
-             relocking)"
+            "upstream content differs from lock (lock kept; investigate, then re-run with \
+             --accept to relock)"
         );
     }
     Ok(())
@@ -329,6 +378,13 @@ pub fn look(names: &[String]) -> Result<()> {
     let display = Display::new(selected.iter().map(|i| i.name.clone()).collect());
 
     selected.par_iter().enumerate().for_each(|(i, inp)| {
+        if inp.pin_type == PinType::Fixed {
+            display.set(
+                i,
+                PinStatus::Skipped("fixed pin, run `tack update` to verify".into()),
+            );
+            return;
+        }
         display.set(i, PinStatus::Fetching);
         let expanded = shorturl::expand(&inp.url, &shorturls);
         let old = lk.get(&inp.name).and_then(lock::rev_of).map(str::to_owned);
@@ -373,21 +429,16 @@ usage:
   tack init [--force]
   tack update [names...] [--accept]
   tack look [names...]
-  tack add <name> <url> [--no-flake] [--dir <d>] [--submodules] [--follows c=p]...
+  tack add <name> <url> [--fetch|--fixed [--unpack tarball|file]]
+                        [--dir <d>] [--submodules] [--follows c=p]...
   tack rm <name>
   tack alias <name> <template> | tack alias --rm <name>
 
-tack lives in ./.tack/ by default; legacy root layouts (pins.toml etc. at
-cwd alongside inputs.nix) are detected and kept as-is. TACK_DIR overrides.
+pin types: flake (default), fetch (source tree only), fixed (FOD)
 
-import from your flake/config:
+tack lives in ./.tack/ by default
+use `import ./.tack` to use inputs
 
-  outputs = { self }:
-    let inputs = import ./.tack; in {
-      packages.x86_64-linux.default =
-        inputs.nixpkgs.legacyPackages.x86_64-linux.hello;
-    }};
-
-git flakes only see tracked files, so commit the contents of .tack/"
+"
     );
 }

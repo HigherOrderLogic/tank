@@ -28,11 +28,22 @@ fn run() -> anyhow::Result<()> {
         Command::Add {
             name,
             url,
-            flake,
+            pin_type,
+            unpack,
             dir,
             submodules,
             follows,
-        } => commands::add(&name, &url, flake, dir.as_deref(), submodules, &follows),
+        } => {
+            commands::add(
+                &name,
+                &url,
+                pin_type,
+                unpack,
+                dir.as_deref(),
+                submodules,
+                &follows,
+            )
+        },
         Command::Rm { name } => commands::rm(&name),
         Command::Alias { name, template, rm } => commands::alias(&name, template.as_deref(), rm),
         Command::Help => {

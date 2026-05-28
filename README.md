@@ -30,25 +30,37 @@ outputs = { self }:
   };
 ```
 
-the resolver carries a `# tack-managed resolver. delete this line ...`
-marker. any tack command that touches the lock will auto-refresh
-`default.nix` from the running binary's bundled copy while the marker is
-present; remove the marker line to fork the resolver and tack will leave
-it alone.
+tack keeps `default.nix` in sync with the running binary while a
+`tack-managed` comment is present at its top; delete that line to fork
+the resolver.
 
-legacy: existing layouts with `./inputs.nix` at repo root are detected
-and kept as-is. `tack` will read and write the legacy files in place.
+legacy `./inputs.nix` at repo root is detected and preserved as-is.
 
 ## commands
 
 ```
 tack init [--force]
-tack update [names...]   fetch latest, rewrite lock
-tack look [names...]     report pins with newer upstream revs
-tack add <name> <url> [--no-flake] [--dir <d>] [--submodules] [--follows c=p]...
+tack update [names...] [--accept]    fetch latest, rewrite lock
+tack look [names...]                 report pins with newer upstream revs
+tack add <name> <url> [--fetch|--fixed [--unpack tarball|file]]
+                      [--dir <d>] [--submodules] [--follows c=p]...
 tack rm <name>
-tack alias <name> <template>   define a shorturl scheme
-tack alias --rm <name>         remove one
+tack alias <name> <template>         define a shorturl scheme
+tack alias --rm <name>               remove one
+```
+
+## pin types
+
+- `flake` (default) — evaluate the input's `flake.nix`, expose its outputs
+- `fetch` — source tree only, no flake eval. legacy `flake = false`
+- `fixed` — hash-locked download; won't drift, `tack update` refuses to
+  silently relock (use `--accept` if you want to)
+
+```toml
+[inputs.release]
+url = "https://example.com/release-1.2.3.tar.gz"
+type = "fixed"
+# unpack = "tarball" | "file"   # auto-detected from the URL
 ```
 
 ## url schemes

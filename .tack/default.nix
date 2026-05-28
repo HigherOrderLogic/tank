@@ -8,6 +8,28 @@ let
 
   fetchPin = name: builtins.fetchTree lock.${name};
 
+  fetchFixed =
+    name: entry:
+    let
+      raw = derivation {
+        inherit name;
+        builder = "builtin:fetchurl";
+        system = "builtin";
+        url = entry.url;
+        outputHash = entry.sha256;
+        outputHashAlgo = "sha256";
+        outputHashMode = "flat";
+      };
+      unpacked = derivation {
+        inherit name;
+        builder = "builtin:unpack-channel";
+        system = "builtin";
+        src = raw;
+        channelName = name;
+      };
+    in
+    if (entry.unpack or "file") == "tarball" then unpacked.outPath + "/" + name else raw.outPath;
+
   resolveSpec = upLock: spec: if builtins.isList spec then walkPath upLock upLock.root spec else spec;
 
   walkPath =
@@ -95,10 +117,22 @@ let
   loadPin =
     name: pin:
     let
-      sourceInfo = fetchPin name;
+      pinType =
+        if pin ? type then
+          pin.type
+        else if pin.flake or true then
+          "flake"
+        else
+          "fetch";
       subdir = if pin ? dir then "/" + pin.dir else "";
     in
-    if pin.flake or true then evalTopFlake sourceInfo pin else sourceInfo.outPath + subdir;
+    if pinType == "fixed" then
+      fetchFixed name lock.${name}
+    else
+      let
+        sourceInfo = fetchPin name;
+      in
+      if pinType == "flake" then evalTopFlake sourceInfo pin else sourceInfo.outPath + subdir;
 
   self = builtins.mapAttrs loadPin pins.inputs;
 in

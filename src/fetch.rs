@@ -44,7 +44,10 @@ use ureq::{
 };
 use xz2::read::XzDecoder;
 
-use crate::nar;
+use crate::{
+    nar,
+    pins::Unpack,
+};
 
 fn agent() -> &'static Agent {
     static AGENT: OnceLock<Agent> = OnceLock::new();
@@ -159,6 +162,44 @@ pub fn current_rev(expanded: &str) -> Result<String> {
             Ok(immutable_url_of(&resp, &url))
         },
     }
+}
+
+/// Fetch a `fixed` pin: download URL bytes, sha256 them as raw bytes (not NAR),
+/// return the locked node plus the sha256 (used for the drift-display "rev").
+/// Auto-detects `unpack` from URL extension when not supplied.
+pub fn fetch_fixed_pin(url: &str, unpack: Option<Unpack>) -> Result<(Value, String)> {
+    if !url.starts_with("https://") && !url.starts_with("http://") {
+        bail!("fixed pins require a plain http(s) URL, got: {url}");
+    }
+    let resp = agent()
+        .get(url)
+        .set("User-Agent", "tack")
+        .call()
+        .with_context(|| format!("GET {url}"))?;
+    let immutable_url = immutable_url_of(&resp, url);
+    let mut bytes = Vec::new();
+    resp.into_reader()
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("read body of {url}"))?;
+    let sha256 = nar::hash_bytes(&bytes);
+    // detect from the user-supplied URL first; the immutable URL may have lost
+    // the extension via a redirect (e.g. github archives -> codeload)
+    let unpack = unpack.unwrap_or_else(|| {
+        if Unpack::detect(url) == Unpack::Tarball
+            || Unpack::detect(&immutable_url) == Unpack::Tarball
+        {
+            Unpack::Tarball
+        } else {
+            Unpack::File
+        }
+    });
+    let node = json!({
+        "type": "fixed",
+        "url": immutable_url,
+        "sha256": sha256,
+        "unpack": unpack.as_str(),
+    });
+    Ok((node, sha256))
 }
 
 /// fetch the tree, return (locked node, rev)
