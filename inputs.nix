@@ -3,13 +3,11 @@
 let
   pins = builtins.fromTOML (builtins.readFile ./pins.toml);
   lock = builtins.fromJSON (builtins.readFile ./pins.lock.json);
-  all_follow = pins.all_follow or {};
+  all_follow = pins.all_follow or { };
 
   fetchPin = name: builtins.fetchTree lock.${name};
 
-  resolveSpec =
-    upLock: spec:
-    if builtins.isList spec then walkPath upLock upLock.root spec else spec;
+  resolveSpec = upLock: spec: if builtins.isList spec then walkPath upLock upLock.root spec else spec;
 
   walkPath =
     upLock: nodeName: path:
@@ -20,76 +18,76 @@ let
         builtins.tail path
       );
 
-  evalTransitive =
-    upLock: nodeName: sourceInfo:
+  mkCallerInputs =
+    upLock: nodeName: rawInputs: levelFollows: deepFollows:
     let
-      raw = import (sourceInfo.outPath + "/flake.nix");
-      node = upLock.nodes.${nodeName};
-      callerInputs = builtins.mapAttrs (
-        n: _decl:
+      overrides = builtins.mapAttrs (_: target: self.${target}) levelFollows;
+    in
+    builtins.mapAttrs (
+      n: _decl:
+      if overrides ? ${n} then
+        overrides.${n}
+      else if upLock != null then
         let
           ref =
-            (node.inputs or { }).${n}
-              or (throw "tack/inputs.nix: transitive '${n}' missing in flake.lock node '${nodeName}'");
+            (upLock.nodes.${nodeName}.inputs or { }).${n}
+              or (throw "tack/inputs.nix: input '${n}' declared but not in flake.lock node '${nodeName}'");
           childName = resolveSpec upLock ref;
           childNode = upLock.nodes.${childName};
           childSrc = builtins.fetchTree childNode.locked;
         in
-        if childNode.flake or true then evalTransitive upLock childName childSrc else childSrc
-      ) (raw.inputs or { });
+        if childNode.flake or true then evalTransitive upLock childName childSrc deepFollows else childSrc
+      else
+        throw "tack/inputs.nix: no flake.lock; cannot resolve input '${n}'"
+    ) rawInputs;
+
+  evalTransitive =
+    upLock: nodeName: sourceInfo: follows:
+    let
+      raw = import (sourceInfo.outPath + "/flake.nix");
+      callerInputs = mkCallerInputs upLock nodeName (raw.inputs or { }) follows follows;
       outputs = raw.outputs (callerInputs // { self = result; });
-      result = outputs // sourceInfo // {
-        outPath = sourceInfo.outPath;
-        inputs = callerInputs;
-        inherit outputs;
-        inherit sourceInfo;
-        _type = "flake";
-      };
+      result =
+        outputs
+        // sourceInfo
+        // {
+          outPath = sourceInfo.outPath;
+          inputs = callerInputs;
+          inherit outputs;
+          inherit sourceInfo;
+          _type = "flake";
+        };
     in
     result;
 
   evalTopFlake =
     sourceInfo: pin:
     let
-      raw = import (sourceInfo.outPath + "/flake.nix");
-      upLockPath = sourceInfo.outPath + "/flake.lock";
+      flakeDir = sourceInfo.outPath + (if pin ? dir then "/" + pin.dir else "");
+      raw = import (flakeDir + "/flake.nix");
+      upLockPath = flakeDir + "/flake.lock";
       upLock =
         if builtins.pathExists upLockPath then builtins.fromJSON (builtins.readFile upLockPath) else null;
 
-      exclude_follow = pin.exclude_follow or [];
+      exclude_follow = pin.exclude_follow or [ ];
       explicit_follows = pin.follows or { };
-      all_follow_rules = builtins.filterAttrs
-        (name: _target: !(builtins.elem name exclude_follow))
-        all_follow;
+      all_follow_rules = builtins.removeAttrs all_follow exclude_follow;
       combined_follows = explicit_follows // all_follow_rules;
-      overrides = builtins.mapAttrs (_: target: self.${target}) combined_follows;
 
-      callerInputs = builtins.mapAttrs (
-        n: _decl:
-        if overrides ? ${n} then
-          overrides.${n}
-        else if upLock != null then
-          let
-            ref =
-              (upLock.nodes.${upLock.root}.inputs or { }).${n}
-                or (throw "tack/inputs.nix: input '${n}' declared but not in flake.lock at ${toString sourceInfo.outPath}");
-            childName = resolveSpec upLock ref;
-            childNode = upLock.nodes.${childName};
-            childSrc = builtins.fetchTree childNode.locked;
-          in
-          if childNode.flake or true then evalTransitive upLock childName childSrc else childSrc
-        else
-          throw "tack/inputs.nix: no flake.lock at ${toString sourceInfo.outPath}; cannot resolve '${n}'"
-      ) (raw.inputs or { });
+      rootNode = if upLock != null then upLock.root else null;
+      callerInputs = mkCallerInputs upLock rootNode (raw.inputs or { }) combined_follows all_follow_rules;
 
       outputs = raw.outputs (callerInputs // { self = result; });
-      result = outputs // sourceInfo // {
-        outPath = sourceInfo.outPath;
-        inputs = callerInputs;
-        inherit outputs;
-        inherit sourceInfo;
-        _type = "flake";
-      };
+      result =
+        outputs
+        // sourceInfo
+        // {
+          outPath = flakeDir;
+          inputs = callerInputs;
+          inherit outputs;
+          inherit sourceInfo;
+          _type = "flake";
+        };
     in
     result;
 
@@ -97,8 +95,9 @@ let
     name: pin:
     let
       sourceInfo = fetchPin name;
+      subdir = if pin ? dir then "/" + pin.dir else "";
     in
-    if pin.flake or true then evalTopFlake sourceInfo pin else sourceInfo.outPath;
+    if pin.flake or true then evalTopFlake sourceInfo pin else sourceInfo.outPath + subdir;
 
   self = builtins.mapAttrs loadPin pins.inputs;
 in
