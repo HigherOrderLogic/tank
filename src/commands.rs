@@ -133,7 +133,7 @@ pub fn alias(name: &str, template: Option<&str>, remove: bool) -> Result<()> {
     Ok(())
 }
 
-pub fn update(names: &[String]) -> Result<()> {
+pub fn update(names: &[String], accept: bool) -> Result<()> {
     let d = dir();
     let doc = pins::load(&pins_path(&d))?;
     let shorturls = pins::shorturls(&doc);
@@ -162,13 +162,35 @@ pub fn update(names: &[String]) -> Result<()> {
                         (old.and_then(lock::hash_of), lock::hash_of(&node)),
                         (Some(o), Some(n)) if o != n
                     );
-                    if drifted {
-                        drift.fetch_add(1, Ordering::Relaxed);
-                        display.set(i, PinStatus::Drift { rev: short(&rev) });
-                    } else {
-                        display.set(i, PinStatus::NoChange);
+                    match (drifted, accept) {
+                        // relock to the drifted tree, the user vouched for it
+                        (true, true) => {
+                            display.set(
+                                i,
+                                PinStatus::Drift {
+                                    rev: short(&rev),
+                                    accepted: true,
+                                },
+                            );
+                            Some(node)
+                        }
+                        // trip the alarm and keep the locked node
+                        (true, false) => {
+                            drift.fetch_add(1, Ordering::Relaxed);
+                            display.set(
+                                i,
+                                PinStatus::Drift {
+                                    rev: short(&rev),
+                                    accepted: false,
+                                },
+                            );
+                            None
+                        }
+                        (false, _) => {
+                            display.set(i, PinStatus::NoChange);
+                            None
+                        }
                     }
-                    None
                 }
                 Ok((node, rev)) => {
                     display.set(
@@ -265,7 +287,7 @@ pub fn help() {
 
 usage:
   tack init [--force]
-  tack update [names...]
+  tack update [names...] [--accept]
   tack look [names...]
   tack add <name> <url> [--no-flake] [--dir <d>] [--submodules] [--follows c=p]...
   tack rm <name>

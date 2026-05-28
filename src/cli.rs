@@ -8,6 +8,7 @@ pub enum Command {
     },
     Update {
         names: Vec<String>,
+        accept: bool,
     },
     Look {
         names: Vec<String>,
@@ -56,14 +57,16 @@ pub fn parse() -> Result<Command> {
         }
         "update" | "look" => {
             let mut names = Vec::new();
+            let mut accept = false;
             while let Some(a) = p.next()? {
                 match a {
+                    Long("accept") if sub == "update" => accept = true,
                     Value(v) => names.push(v.string().map_err(|_| anyhow::anyhow!("bad name"))?),
                     _ => return Err(a.unexpected().into()),
                 }
             }
             Ok(if sub == "update" {
-                Command::Update { names }
+                Command::Update { names, accept }
             } else {
                 Command::Look { names }
             })
