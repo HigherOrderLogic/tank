@@ -286,6 +286,7 @@ pub fn help() {
         "tack: flake-like toml nix pins, lazily fetched and transformed
 
 usage:
+  tack [-h|--help|help]
   tack init [--force]
   tack update [names...] [--accept]
   tack look [names...]

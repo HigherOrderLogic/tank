@@ -2,6 +2,7 @@
 
 use anyhow::{Context, Result, bail};
 
+#[derive(Debug, PartialEq, Eq)]
 pub enum Command {
     Init {
         force: bool,
@@ -33,10 +34,14 @@ pub enum Command {
 }
 
 pub fn parse() -> Result<Command> {
+    parse_parser(lexopt::Parser::from_env())
+}
+
+fn parse_parser(mut p: lexopt::Parser) -> Result<Command> {
     use lexopt::prelude::*;
-    let mut p = lexopt::Parser::from_env();
 
     let sub = match p.next()? {
+        Some(Long("help") | Short('h')) => return Ok(Command::Help),
         Some(Value(v)) => v
             .string()
             .map_err(|_| anyhow::anyhow!("invalid subcommand"))?,
@@ -45,6 +50,7 @@ pub fn parse() -> Result<Command> {
     };
 
     match sub.as_str() {
+        "help" => Ok(Command::Help),
         "init" => {
             let mut force = false;
             while let Some(a) = p.next()? {
@@ -165,5 +171,22 @@ fn parse_follows(s: &str) -> (String, String) {
     match s.split_once('=') {
         Some((c, p)) => (c.to_string(), p.to_string()),
         None => (s.to_string(), s.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Command, parse_parser};
+
+    fn parse(args: &[&str]) -> Command {
+        parse_parser(lexopt::Parser::from_args(args)).expect("arguments should parse")
+    }
+
+    #[test]
+    fn help_aliases_parse_as_help() {
+        assert_eq!(parse(&[]), Command::Help);
+        assert_eq!(parse(&["help"]), Command::Help);
+        assert_eq!(parse(&["-h"]), Command::Help);
+        assert_eq!(parse(&["--help"]), Command::Help);
     }
 }
